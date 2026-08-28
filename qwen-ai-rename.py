@@ -4,6 +4,7 @@ import mimetypes
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -31,6 +32,9 @@ MAX_FOLDER_ENTRIES = 250
 MAX_ARCHIVE_BYTES = 12 * 1024 * 1024
 MAX_FILENAME_BYTES = 240
 IMAGE_MAX_DIMENSION = 1600
+SERVER_READY_TIMEOUT_SECONDS = 45
+REQUEST_TIMEOUT_SECONDS = 90
+WORKER_TIMEOUT_SECONDS = 120
 
 TEXT_SUFFIXES = {
     ".cfg",
@@ -335,10 +339,10 @@ def request_name(content):
         headers={"Content-Type": "application/json"},
     )
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    retry_deadline = time.monotonic() + 180
+    retry_deadline = time.monotonic() + SERVER_READY_TIMEOUT_SECONDS
     while True:
         try:
-            with opener.open(request, timeout=180) as response:
+            with opener.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
                 result = json.load(response)
             break
         except urllib.error.HTTPError as error:
@@ -421,6 +425,7 @@ def suggest_name(path):
 class QwenAiRenameExtension(GObject.GObject, Nemo.MenuProvider):
     def __init__(self):
         super().__init__()
+        self._workers = set()
         icon_theme = Gtk.IconTheme.get_default()
         if icon_theme and ICON_DIRECTORY not in icon_theme.get_search_path():
             icon_theme.append_search_path(ICON_DIRECTORY)
@@ -441,12 +446,54 @@ class QwenAiRenameExtension(GObject.GObject, Nemo.MenuProvider):
             tip="Analyze this item locally and suggest a meaningful name",
             icon=ICON_NAME,
         )
-        menu_item.connect("activate", self._start_analysis, path, window)
+        menu_item.connect("activate", self._launch_worker, path, window)
         return (menu_item,)
 
-    def _start_analysis(self, _menu_item, path, window):
-        parent = window if isinstance(window, Gtk.Window) else None
-        dialog = Gtk.Dialog(title="Qwen Name Suggestion", transient_for=parent)
+    def _launch_worker(self, _menu_item, path, window):
+        try:
+            worker = subprocess.Popen(
+                ["/usr/bin/python3", os.path.abspath(__file__), "--worker", path],
+                stdin=subprocess.DEVNULL,
+                close_fds=True,
+                start_new_session=True,
+            )
+            self._workers.add(worker)
+            GLib.timeout_add_seconds(1, self._reap_worker, worker)
+        except OSError as error:
+            parent = window if isinstance(window, Gtk.Window) else None
+            dialog = Gtk.MessageDialog(
+                transient_for=parent,
+                modal=True,
+                message_type=Gtk.MessageType.ERROR,
+                buttons=Gtk.ButtonsType.CLOSE,
+                text="Could not start Qwen rename",
+            )
+            dialog.format_secondary_text(str(error))
+            dialog.run()
+            dialog.destroy()
+
+    def _reap_worker(self, worker):
+        if worker.poll() is None:
+            return GLib.SOURCE_CONTINUE
+        self._workers.discard(worker)
+        return GLib.SOURCE_REMOVE
+
+
+class QwenRenameWorker:
+    def __init__(self):
+        self.cancelled = threading.Event()
+        self.progress_dialog = None
+        self.timeout_source = None
+
+    def run(self, path):
+        if not os.path.lexists(path):
+            self._show_error(
+                "Could not suggest a name",
+                "The selected file or folder no longer exists.",
+            )
+            return
+        self.progress_dialog = Gtk.Dialog(title="Qwen Name Suggestion")
+        dialog = self.progress_dialog
         dialog.set_modal(False)
         dialog.set_default_size(380, 120)
         dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
@@ -461,22 +508,37 @@ class QwenAiRenameExtension(GObject.GObject, Nemo.MenuProvider):
         label.set_xalign(0)
         row.pack_start(label, True, True, 0)
         content_area.add(row)
-        cancelled = threading.Event()
-
-        def cancel_job(_dialog, _response):
-            cancelled.set()
-            _dialog.destroy()
-
-        dialog.connect("response", cancel_job)
+        dialog.connect("response", self._cancel)
         dialog.show_all()
+        self.timeout_source = GLib.timeout_add_seconds(WORKER_TIMEOUT_SECONDS, self._timeout)
         worker = threading.Thread(
             target=self._analyze_in_background,
-            args=(path, parent, dialog, cancelled),
+            args=(path,),
             daemon=True,
         )
         worker.start()
+        Gtk.main()
 
-    def _analyze_in_background(self, path, parent, progress_dialog, cancelled):
+    def _cancel(self, dialog, _response):
+        self.cancelled.set()
+        dialog.destroy()
+        Gtk.main_quit()
+
+    def _timeout(self):
+        if self.cancelled.is_set():
+            return GLib.SOURCE_REMOVE
+        self.cancelled.set()
+        if self.progress_dialog:
+            self.progress_dialog.destroy()
+        self._show_error(
+            "Qwen analysis timed out",
+            f"No result was received within {WORKER_TIMEOUT_SECONDS} seconds. "
+            "The local model may still be loading or may need to be restarted.",
+        )
+        Gtk.main_quit()
+        return GLib.SOURCE_REMOVE
+
+    def _analyze_in_background(self, path):
         try:
             suggestion = suggest_name(path)
             error = None
@@ -486,25 +548,28 @@ class QwenAiRenameExtension(GObject.GObject, Nemo.MenuProvider):
         GLib.idle_add(
             self._finish_analysis,
             path,
-            parent,
-            progress_dialog,
-            cancelled,
             suggestion,
             error,
         )
 
-    def _finish_analysis(self, path, parent, progress_dialog, cancelled, suggestion, error):
-        if cancelled.is_set():
+    def _finish_analysis(self, path, suggestion, error):
+        if self.cancelled.is_set():
             return GLib.SOURCE_REMOVE
-        progress_dialog.destroy()
+        if self.timeout_source:
+            GLib.source_remove(self.timeout_source)
+            self.timeout_source = None
+        if self.progress_dialog:
+            self.progress_dialog.destroy()
         if error:
-            self._show_error(parent, "Could not suggest a name", error)
+            self._show_error("Could not suggest a name", error)
+            Gtk.main_quit()
             return GLib.SOURCE_REMOVE
-        self._show_rename_dialog(parent, path, suggestion)
+        self._show_rename_dialog(path, suggestion)
+        Gtk.main_quit()
         return GLib.SOURCE_REMOVE
 
-    def _show_rename_dialog(self, parent, path, suggestion):
-        dialog = Gtk.Dialog(title="Rename with Qwen Suggestion", transient_for=parent)
+    def _show_rename_dialog(self, path, suggestion):
+        dialog = Gtk.Dialog(title="Rename with Qwen Suggestion")
         dialog.set_modal(True)
         dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
         rename_button = dialog.add_button("Rename", Gtk.ResponseType.OK)
@@ -535,7 +600,7 @@ class QwenAiRenameExtension(GObject.GObject, Nemo.MenuProvider):
             return
         validation_error = self._validate_new_name(path, new_name)
         if validation_error:
-            self._show_error(parent, "Could not rename", validation_error)
+            self._show_error("Could not rename", validation_error)
             return
         target_path = os.path.join(os.path.dirname(path), new_name)
         if os.path.abspath(target_path) == os.path.abspath(path):
@@ -543,7 +608,7 @@ class QwenAiRenameExtension(GObject.GObject, Nemo.MenuProvider):
         try:
             os.rename(path, target_path)
         except OSError as rename_error:
-            self._show_error(parent, "Could not rename", str(rename_error))
+            self._show_error("Could not rename", str(rename_error))
 
     @staticmethod
     def _validate_new_name(path, new_name):
@@ -559,9 +624,8 @@ class QwenAiRenameExtension(GObject.GObject, Nemo.MenuProvider):
         return None
 
     @staticmethod
-    def _show_error(parent, title, detail):
+    def _show_error(title, detail):
         dialog = Gtk.MessageDialog(
-            transient_for=parent,
             modal=True,
             message_type=Gtk.MessageType.ERROR,
             buttons=Gtk.ButtonsType.CLOSE,
@@ -570,3 +634,13 @@ class QwenAiRenameExtension(GObject.GObject, Nemo.MenuProvider):
         dialog.format_secondary_text(detail)
         dialog.run()
         dialog.destroy()
+
+
+def main():
+    if len(sys.argv) != 3 or sys.argv[1] != "--worker":
+        raise SystemExit("Usage: qwen-ai-rename.py --worker PATH")
+    QwenRenameWorker().run(os.path.abspath(sys.argv[2]))
+
+
+if __name__ == "__main__":
+    main()

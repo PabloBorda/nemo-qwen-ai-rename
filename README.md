@@ -12,7 +12,8 @@ All inference stays local. The extension connects only to `127.0.0.1:8080`.
 - Extracts bounded text samples from PDFs, text files, DOC/DOCX, spreadsheets, presentations,
   EPUB, and OpenDocument files.
 - Summarizes a bounded folder listing without uploading its contents anywhere.
-- Runs extraction and inference in a background thread so Nemo remains responsive.
+- Runs extraction and inference in an isolated worker process so Nemo remains responsive.
+- Cancels cleanly and stops waiting after a two-minute end-to-end deadline.
 - Preserves file extensions, including common compound extensions.
 - Rejects path separators, oversized names, and collisions.
 - Requires explicit confirmation before renaming.
