@@ -54,8 +54,9 @@ The model must support the `/v1/chat/completions` endpoint and OpenAI-style imag
 
 ```bash
 mkdir -p ~/.local/share/nemo-python/extensions
-cp qwen-ai-rename.py ~/.local/share/nemo-python/extensions/
+cp qwen-ai-rename.py nemo-qwen-ai-rename.svg ~/.local/share/nemo-python/extensions/
 nemo --quit
+pkill -x nemo-desktop
 ```
 
 Open Nemo again, right-click one supported local file or folder, and select
@@ -82,8 +83,10 @@ The endpoint and extraction limits are constants near the top of `qwen-ai-rename
 ## Uninstall
 
 ```bash
-rm ~/.local/share/nemo-python/extensions/qwen-ai-rename.py
+rm ~/.local/share/nemo-python/extensions/qwen-ai-rename.py \
+  ~/.local/share/nemo-python/extensions/nemo-qwen-ai-rename.svg
 nemo --quit
+pkill -x nemo-desktop
 ```
 
 Open Nemo again to finish unloading the extension.

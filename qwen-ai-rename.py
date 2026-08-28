@@ -24,6 +24,8 @@ from gi.repository import GdkPixbuf, GLib, GObject, Gtk, Nemo
 
 
 QWEN_ENDPOINT = "http://127.0.0.1:8080/v1/chat/completions"
+ICON_NAME = "nemo-qwen-ai-rename"
+ICON_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
 MAX_TEXT_CHARS = 40_000
 MAX_FOLDER_ENTRIES = 250
 MAX_ARCHIVE_BYTES = 12 * 1024 * 1024
@@ -417,6 +419,12 @@ def suggest_name(path):
 
 
 class QwenAiRenameExtension(GObject.GObject, Nemo.MenuProvider):
+    def __init__(self):
+        super().__init__()
+        icon_theme = Gtk.IconTheme.get_default()
+        if icon_theme and ICON_DIRECTORY not in icon_theme.get_search_path():
+            icon_theme.append_search_path(ICON_DIRECTORY)
+
     def get_file_items(self, window, selected_files):
         if len(selected_files) != 1:
             return ()
@@ -431,7 +439,7 @@ class QwenAiRenameExtension(GObject.GObject, Nemo.MenuProvider):
             name="QwenAiRenameExtension::suggest-name",
             label="Suggest Name with Qwen VL…",
             tip="Analyze this item locally and suggest a meaningful name",
-            icon="edit-rename-symbolic",
+            icon=ICON_NAME,
         )
         menu_item.connect("activate", self._start_analysis, path, window)
         return (menu_item,)
